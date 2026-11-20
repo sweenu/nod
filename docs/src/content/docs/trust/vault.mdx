@@ -57,6 +57,18 @@ This needs the 1Password 8 app alongside Nod's runtime, signed in, with **Settin
 - **Where it runs.** A small helper process talks to 1Password; the Nod server never loads 1Password's code. 1Password's approval lets that helper read your account until it's idle for 10 minutes or you lock 1Password, and Nod closes it after 10 idle minutes.
 - **Why a copy.** Scheduled and background tasks can then sign in without waiting for you to approve in 1Password. If you change the password in 1Password, choose the login from 1Password again the next time Nod asks, and the copy is updated.
 
+## Use a login from Bitwarden
+
+In the private **Sign in** form, select **Use Bitwarden**. Enter the email of your Bitwarden account and your master password, then choose the login. Nod saves a copy in Vault, with its authenticator key, and signs in.
+
+This needs the [Bitwarden command-line app](https://bitwarden.com/help/cli/) (`bw`) on the computer that runs Nod, signed in once with `bw login` in a terminal. The button appears only when Nod finds `bw`: on your `PATH`, or in a usual install folder such as `/opt/homebrew/bin`, `/usr/local/bin` or `~/.local/bin`, or on Windows WinGet, Scoop or Chocolatey. On Windows, install the `bw.exe` build, because Nod can't start the npm `bw.cmd` script. A desktop client connected to a remote server doesn't give that server access to the client's Bitwarden.
+
+- **What Nod reads.** Nod unlocks Bitwarden, syncs it, and lists only the logins whose website matches the page in front of you. A URI set to **Never** or **Regular expression** never matches; **Host**, **Starts with** and **Exact** need the same host. Only the one you choose is copied to Vault, and the model never sees the list or any value.
+- **Your master password.** Nod passes it to `bw` once to unlock and doesn't save it. While unlocked, `bw` can read your whole Bitwarden vault. Nod locks it again right after you pick a login, or after 5 minutes. Unlocking from Nod ends any `bw` session you unlocked yourself in a terminal.
+- **Why a copy.** Scheduled and background tasks can then sign in without your master password. If you change the password in Bitwarden, choose the login from Bitwarden again the next time Nod asks, and the copy is updated.
+
+If Nod can't read the authenticator key of a login you pick from 1Password or Bitwarden, such as a Steam code, it saves the login without the key, says so in the form, and asks you for codes when the website wants one.
+
 ## How sign-in works
 
 ```mermaid
@@ -164,7 +176,7 @@ If you set the key yourself, keep a copy somewhere safe. Saved logins can't be r
 
 ## Where this is enforced
 
-[`src/server/vault-access.ts`](https://github.com/n8n-io/nod/blob/main/src/server/vault-access.ts) (permission and activity) · [`src/server/authenticator.ts`](https://github.com/n8n-io/nod/blob/main/src/server/authenticator.ts) (authenticator codes) · [`src/providers/onepassword`](https://github.com/n8n-io/nod/tree/main/src/providers/onepassword) (1Password helper) · [`src/server/vault-use.ts`](https://github.com/n8n-io/nod/blob/main/src/server/vault-use.ts) (one use) · [`src/server/vault-crypto.ts`](https://github.com/n8n-io/nod/blob/main/src/server/vault-crypto.ts) (encryption) · [`src/providers/agent-browser`](https://github.com/n8n-io/nod/tree/main/src/providers/agent-browser) (origin checks and private entry)
+[`src/server/vault-access.ts`](https://github.com/n8n-io/nod/blob/main/src/server/vault-access.ts) (permission and activity) · [`src/server/authenticator.ts`](https://github.com/n8n-io/nod/blob/main/src/server/authenticator.ts) (authenticator codes) · [`src/providers/onepassword`](https://github.com/n8n-io/nod/tree/main/src/providers/onepassword) (1Password helper) · [`src/providers/bitwarden`](https://github.com/n8n-io/nod/tree/main/src/providers/bitwarden) (Bitwarden) · [`src/server/vault-use.ts`](https://github.com/n8n-io/nod/blob/main/src/server/vault-use.ts) (one use) · [`src/server/vault-crypto.ts`](https://github.com/n8n-io/nod/blob/main/src/server/vault-crypto.ts) (encryption) · [`src/providers/agent-browser`](https://github.com/n8n-io/nod/tree/main/src/providers/agent-browser) (origin checks and private entry)
 
 ## Related resources
 

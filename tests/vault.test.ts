@@ -41,7 +41,7 @@ import type {
   VaultLoginEntry,
 } from '../src/shared/contracts.ts';
 import { parsePasswordCsv } from '../src/shared/password-import.ts';
-import { matchingWebsite } from '../src/providers/onepassword/websites.ts';
+import { matchingWebsite } from '../src/providers/password-manager-websites.ts';
 import { createOnePassword, forkedOnePassword } from '../src/providers/onepassword/index.ts';
 import { PasswordManagerError, type PasswordManager } from '../src/ports/password-manager.ts';
 import { createPayments } from '../src/server/payments.ts';
@@ -214,6 +214,148 @@ test('an idle 1Password helper closing late never fails a request on its replace
     assert.equal(opened, 2);
   } finally {
     await manager.close();
+  }
+});
+
+const bitwardenScript = String.raw`#!/usr/bin/env node
+const fs = require('fs');
+const state = JSON.parse(fs.readFileSync(__dirname + '/state.json', 'utf8'));
+const [flag, command, ...rest] = process.argv.slice(2);
+fs.appendFileSync(__dirname + '/calls.log', JSON.stringify({ argv: process.argv.slice(2), session: process.env.BW_SESSION || null, password: process.env.BW_PASSWORD || null }) + '\n');
+const fail = (message) => { process.stderr.write(message); process.exit(1); };
+const session = 'synthetic-session-key';
+if (flag !== '--nointeraction') fail('interactive');
+else if (command === 'status') process.stdout.write(JSON.stringify({ status: state.status, userEmail: state.email }));
+else if (command === 'unlock') {
+  if (process.env.BW_PASSWORD !== state.password) fail('Invalid master password ' + process.env.BW_PASSWORD);
+  else process.stdout.write(session);
+} else if (process.env.BW_SESSION !== session) fail('Vault is locked.');
+else if (command === 'list') process.stdout.write(JSON.stringify(state.items));
+else if (command === 'get') {
+  const item = state.items.find((entry) => entry.id === rest[1]);
+  if (item) process.stdout.write(JSON.stringify(item));
+  else fail('Not found.');
+} else process.stdout.write('ok');
+`;
+
+test('a Bitwarden login is offered only for its website and the master password stays out of argv', async () => {
+  const { chmod, mkdtemp, readFile, rm, writeFile } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { createBitwarden } = await import('../src/providers/bitwarden/index.ts');
+  const directory = await mkdtemp(join(tmpdir(), 'nod-bitwarden-'));
+  const command = join(directory, 'bw');
+  await writeFile(command, bitwardenScript);
+  await chmod(command, 0o755);
+  const origin = 'https://bank.example.test';
+  const id = (n: number) => `00000000-0000-4000-8000-00000000000${n}`;
+  const login = (n: number, uri: string, match: number | null = null, extra = {}) => ({
+    id: id(n),
+    name: `Login ${n}`,
+    type: 1,
+    login: {
+      username: `owner${n}@bank.example.test`,
+      password: `synthetic-password-${n}`,
+      totp: n === 1 ? 'JBSWY3DPEHPK3PXP' : null,
+      uris: [{ uri, match }],
+    },
+    ...extra,
+  });
+  const state = (patch: Record<string, unknown> = {}) =>
+    writeFile(
+      join(directory, 'state.json'),
+      JSON.stringify({
+        status: 'locked',
+        email: 'Owner@Bank.example.test',
+        password: 'synthetic-master-password',
+        items: [
+          login(1, 'https://www.bank.example.test/login'),
+          login(2, 'https://bank.example.test', 1),
+          login(3, 'https://login.bank.example.test', 1),
+          login(4, 'https://bank.example.test', 5),
+          login(5, 'https://bank.example.test', 4),
+          login(6, 'https://bank.example.test.attacker.example'),
+          login(7, 'https://bank.example.test', null, { deletedDate: '2026-01-01' }),
+          login(8, 'https://bank.example.test', null, { type: 3 }),
+          { ...login(9, 'https://bank.example.test'), id: '--session=other' },
+        ],
+        ...patch,
+      }),
+    );
+  const calls = async () =>
+    (await readFile(join(directory, 'calls.log'), 'utf8'))
+      .trim()
+      .split('\n')
+      .map(
+        (line) =>
+          JSON.parse(line) as { argv: string[]; session: string | null; password: string | null },
+      );
+  const manager = createBitwarden({ command: async () => command });
+  const master = { masterPassword: 'synthetic-master-password' };
+  try {
+    await state({ status: 'unauthenticated', email: null });
+    await assert.rejects(
+      manager.logins('owner@bank.example.test', origin, master),
+      (error: unknown) => error instanceof PasswordManagerError && error.reason === 'unavailable',
+    );
+    await state();
+    await assert.rejects(
+      manager.logins('someone@else.example.test', origin, master),
+      (error: unknown) =>
+        error instanceof PasswordManagerError && /different account/.test(error.message),
+    );
+    await assert.rejects(
+      manager.logins('owner@bank.example.test', origin, {
+        masterPassword: 'synthetic-wrong-guess',
+      }),
+      (error: unknown) =>
+        error instanceof PasswordManagerError &&
+        /Invalid master password/.test(error.message) &&
+        !error.message.includes('synthetic-wrong-guess'),
+    );
+    assert.ok(!(await calls()).some((call) => call.argv[1] === 'list'));
+
+    const listed = await manager.logins(' owner@bank.example.test ', origin, master);
+    assert.deepEqual(
+      listed.map((entry) => entry.id),
+      [id(1), id(2)],
+    );
+    assert.doesNotMatch(JSON.stringify(listed), /synthetic-password|JBSWY3DP/);
+    await assert.rejects(
+      manager.login('owner@bank.example.test', origin, id(3)),
+      (error: unknown) =>
+        error instanceof PasswordManagerError && /not for this website/.test(error.message),
+    );
+    await assert.rejects(
+      manager.login('owner@bank.example.test', origin, id(1)),
+      (error: unknown) =>
+        error instanceof PasswordManagerError && /locked again/.test(error.message),
+    );
+    await manager.logins('owner@bank.example.test', origin, master);
+    assert.deepEqual(await manager.login('owner@bank.example.test', origin, id(1)), {
+      title: 'Login 1',
+      username: 'owner1@bank.example.test',
+      password: 'synthetic-password-1',
+      authenticatorKey: 'JBSWY3DPEHPK3PXP',
+    });
+    const log = await calls();
+    assert.equal(log.at(-1)?.argv[1], 'lock');
+    assert.ok(log.every((call) => !call.argv.join(' ').includes('synthetic-master-password')));
+    assert.ok(log.every((call) => !call.argv.join(' ').includes('synthetic-session-key')));
+    assert.ok(log.every((call) => call.password === null || call.argv[1] === 'unlock'));
+    const idle = createBitwarden({ command: async () => command, idleMs: 20 });
+    await idle.logins('owner@bank.example.test', origin, master);
+    for (let attempt = 0; attempt < 50 && (await calls()).at(-1)?.argv[1] !== 'lock'; attempt++)
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal((await calls()).at(-1)?.argv[1], 'lock');
+    await assert.rejects(
+      idle.login('owner@bank.example.test', origin, id(1)),
+      (error: unknown) =>
+        error instanceof PasswordManagerError && /locked again/.test(error.message),
+    );
+  } finally {
+    await manager.close();
+    await rm(directory, { recursive: true, force: true });
   }
 });
 
@@ -1894,7 +2036,9 @@ test(
       const resumed: string[] = [];
       const password = 'manager-synthetic-password';
       const manager: PasswordManager = {
+        id: '1password',
         name: '1Password',
+        setup: 'Turn on Settings → Developer → Integrate with other apps.',
         logins: async (account, site) => {
           calls.push(`logins ${account} ${site}`);
           if (account === 'Unreachable')
@@ -1919,6 +2063,23 @@ test(
         },
         close: async () => {},
       };
+      const masterPasswords: string[] = [];
+      const unlocked: PasswordManager = {
+        id: 'bitwarden',
+        name: 'Bitwarden',
+        setup: 'Install the Bitwarden CLI.',
+        masterPassword: true,
+        available: async () => true,
+        logins: async (_account, _site, input) => {
+          masterPasswords.push(input?.masterPassword ?? '');
+          return [];
+        },
+        login: async () => {
+          throw new PasswordManagerError('missing', 'Bitwarden locked again.');
+        },
+        close: async () => {},
+      };
+      const absent: PasswordManager = { ...unlocked, id: 'absent', available: async () => false };
       const options = {
         requestKey: Buffer.alloc(32, 42),
         keyStore: { id: 'fixture', configured: true, getKey: async () => Buffer.alloc(32, 5) },
@@ -1932,7 +2093,10 @@ test(
         },
         retry: async () => {},
       };
-      const vault = await createVault(pool, { ...options, passwordManager: manager });
+      const vault = await createVault(pool, {
+        ...options,
+        passwordManagers: [manager, unlocked, absent],
+      });
       vault.registerRoutes(app);
       const request = {
         origin,
@@ -1947,15 +2111,27 @@ test(
       const path = `/api/credential-requests/${token}`;
       const describe = async () => (await app.inject({ url: path })).json<CredentialRequest>();
       const post = (suffix: string, payload: Record<string, unknown>) =>
-        app.inject({ method: 'POST', url: `${path}${suffix}`, payload });
+        app.inject({
+          method: 'POST',
+          url: `${path}${suffix}`,
+          payload: { manager: '1password', ...payload },
+        });
+      const offered = [
+        { id: '1password', name: '1Password' },
+        { id: 'bitwarden', name: 'Bitwarden', masterPassword: true },
+      ];
 
       await t.test('the form offers the manager and explains a missing app', async () => {
-        assert.deepEqual((await describe()).passwordManager, { name: '1Password' });
+        assert.deepEqual((await describe()).passwordManagers, offered);
         const failed = await post('/password-manager', { account: 'Unreachable' });
         assert.equal(failed.statusCode, 502);
         assert.match(failed.json().error, /Integrate with other apps/);
-        assert.deepEqual((await describe()).passwordManager, { name: '1Password' });
+        assert.deepEqual((await describe()).passwordManagers, offered);
         assert.equal((await post('/password-manager', { account: ' ' })).statusCode, 400);
+        assert.equal(
+          (await post('/password-manager', { manager: 'absent', account: 'a' })).statusCode,
+          404,
+        );
       });
 
       await t.test('listing remembers the account and returns no secret', async () => {
@@ -1965,11 +2141,37 @@ test(
           { id: 'v1/i1', title: 'Bank', username: 'owner@bank.example.test', website: origin },
         ]);
         assert.doesNotMatch(listed.body, /manager-synthetic-password|JBSWY3DP/);
-        assert.deepEqual((await describe()).passwordManager, {
-          name: '1Password',
-          account: 'Synthetic Family',
-        });
+        assert.deepEqual((await describe()).passwordManagers, [
+          { ...offered[0], account: 'Synthetic Family' },
+          offered[1],
+        ]);
         assert.equal(calls.at(-1), `logins Synthetic Family ${origin}`);
+      });
+
+      await t.test('a master password reaches only its manager and is never stored', async () => {
+        const listed = await post('/password-manager', {
+          manager: 'bitwarden',
+          account: 'owner@bank.example.test',
+          masterPassword: 'synthetic-master-password',
+        });
+        assert.equal(listed.statusCode, 200, listed.body);
+        assert.deepEqual(masterPasswords, ['synthetic-master-password']);
+        assert.doesNotMatch(listed.body, /synthetic-master-password/);
+        const locked = await post('/password-manager/use', {
+          manager: 'bitwarden',
+          account: 'owner@bank.example.test',
+          id: 'v1/i1',
+        });
+        assert.equal(locked.statusCode, 409);
+        assert.equal(injections.length, 0);
+        const stored = JSON.stringify(
+          (await pool.query('SELECT * FROM password_manager_accounts')).rows,
+        );
+        assert.doesNotMatch(stored, /synthetic-master-password/);
+        assert.deepEqual((await describe()).passwordManagers, [
+          { ...offered[0], account: 'Synthetic Family' },
+          { ...offered[1], account: 'owner@bank.example.test' },
+        ]);
       });
 
       await t.test('a login for another website is refused before anything is saved', async () => {
@@ -2004,7 +2206,7 @@ test(
         const sealed = JSON.stringify((await pool.query('SELECT * FROM vault_entries')).rows);
         assert.doesNotMatch(sealed, /manager-synthetic-password|JBSWY3DP|owner@bank/);
         assert.equal((await describe()).status, 'filled');
-        assert.equal((await describe()).passwordManager, undefined);
+        assert.equal((await describe()).passwordManagers, undefined);
         const reads = calls.length;
         const again = await post('/password-manager/use', {
           account: 'Synthetic Family',
