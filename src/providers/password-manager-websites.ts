@@ -1,6 +1,6 @@
 import { getDomain } from 'tldts';
 
-export interface OnePasswordWebsite {
+export interface PasswordManagerWebsite {
   url: string;
   autofillBehavior: string;
 }
@@ -20,7 +20,7 @@ function site(hostname: string) {
   return getDomain(hostname, { allowPrivateDomains: true }) ?? hostname;
 }
 
-export function matchingWebsite(websites: OnePasswordWebsite[], origin: string) {
+export function matchingWebsite(websites: PasswordManagerWebsite[], origin: string) {
   const page = new URL(origin);
   return websites.find((website) => {
     const item = address(website.url);

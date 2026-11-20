@@ -210,7 +210,7 @@ export interface CredentialRequest {
   notEntered?: boolean;
   savedEntries?: (VaultLoginEntry & { username: string })[];
   username?: string;
-  passwordManager?: { name: string; account?: string };
+  passwordManagers?: { id: string; name: string; account?: string; masterPassword?: boolean }[];
 }
 export interface PasswordManagerLogin {
   id: string;

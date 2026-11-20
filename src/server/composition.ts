@@ -84,6 +84,7 @@ import {
   desktopOnePassword,
   forkedOnePassword,
 } from '../providers/onepassword/index.ts';
+import { createBitwarden } from '../providers/bitwarden/index.ts';
 import { createComposioProvider } from '../providers/composio/integrations.ts';
 import { createComposioProxy } from '../providers/composio/proxy.ts';
 import {
@@ -251,7 +252,7 @@ export interface ApplicationAdapters {
   integrations: IntegrationProvider;
   observations?: ObservationProvider[];
   keyStore: CredentialKeyStore;
-  passwordManager?: PasswordManager;
+  passwordManagers?: PasswordManager[];
   trash?: Trash;
   desktop?: DesktopControl;
   keepAwake?: KeepAwake;
@@ -514,9 +515,14 @@ export function createDefaultAdapters(
       traces,
     }),
     computer: createContainerBrowserComputer({ dataRoot, container: env.BROWSER_CONTAINER }),
-    passwordManager: createOnePassword({
-      open: desktopMode ? desktopOnePassword() : forkedOnePassword(env.NOD_APP_VERSION || 'source'),
-    }),
+    passwordManagers: [
+      createOnePassword({
+        open: desktopMode
+          ? desktopOnePassword()
+          : forkedOnePassword(env.NOD_APP_VERSION || 'source'),
+      }),
+      createBitwarden(),
+    ],
     trash: desktopMode ? desktopTrash() : undefined,
     desktop: desktopMode ? desktopControl() : undefined,
     keepAwake: desktopMode ? desktopKeepAwake() : undefined,
@@ -1390,7 +1396,7 @@ async function initializeApplication(
     },
     emailCode: (input, signal) => integrations.emailCode(ownerId, input, signal),
     icon,
-    passwordManager: adapters.passwordManager,
+    passwordManagers: adapters.passwordManagers,
     onOwnerUse: (entry, client) => vaultAccess.ownerUse(entry, client),
     onUse: (use, client) =>
       vaultAccess.used(
@@ -3565,7 +3571,7 @@ async function initializeApplication(
     const failures: unknown[] = [];
     for (const close of [
       () => adapters.integrationBrowser?.close(),
-      () => adapters.passwordManager?.close(),
+      () => Promise.all((adapters.passwordManagers ?? []).map((manager) => manager.close())),
       () => adapters.localSpeech?.close(),
       () => channels?.close(),
       () => activity.close(),

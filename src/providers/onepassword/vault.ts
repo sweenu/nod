@@ -12,7 +12,7 @@ import {
   type PasswordManagerLogin,
   type PasswordManagerSecret,
 } from '../../ports/password-manager.ts';
-import { matchingWebsite } from './websites.ts';
+import { matchingWebsite } from '../password-manager-websites.ts';
 
 function failure(reason: 'unavailable' | 'failed', error: unknown) {
   if (error instanceof PasswordManagerError) return error;

@@ -19,10 +19,12 @@ import { subscribeAppEvents } from '../lib/app-events';
 import { Button, Field, Input, Loading, Notice } from '../components/ui';
 import { BrandMark } from '../components/brand';
 
+type Manager = NonNullable<CredentialRequest['passwordManagers']>[number];
+
 type ManagerState =
-  | { stage: 'account'; account?: string }
-  | { stage: 'waiting'; account: string }
-  | { stage: 'list'; account: string; logins: PasswordManagerLogin[] };
+  | { stage: 'account'; manager: Manager; account?: string }
+  | { stage: 'waiting'; manager: Manager; account: string }
+  | { stage: 'list'; manager: Manager; account: string; logins: PasswordManagerLogin[] };
 
 type PrivateFormProps = {
   id: string;
@@ -278,6 +280,7 @@ function CredentialForm({ id, embedded, onClose, onRequestChange }: PrivateFormP
   const [retried, setRetried] = useState(false);
   const [enterNew, setEnterNew] = useState(false);
   const [manager, setManager] = useState<ManagerState | null>(null);
+  const [keySkipped, setKeySkipped] = useState(false);
   useEffect(() => {
     if (!request || (request.status === 'uncertain' && !retried)) return;
     const controller = new AbortController();
@@ -364,7 +367,7 @@ function CredentialForm({ id, embedded, onClose, onRequestChange }: PrivateFormP
   const password = request?.kind === 'password';
   const savedEntries = request?.kind === 'otp' ? [] : (request?.savedEntries ?? []);
   const choosingSaved = savedEntries.length > 0 && !enterNew && !manager;
-  const managerName = request?.passwordManager?.name;
+  const managerName = manager?.manager.name;
   async function perform<T>(
     suffix: string,
     input: unknown,
@@ -465,29 +468,32 @@ function CredentialForm({ id, embedded, onClose, onRequestChange }: PrivateFormP
       'This saved login could not be used. Try again or choose another login.',
     );
   }
-  async function listManaged(account: string) {
+  async function listManaged(chosen: Manager, account: string, masterPassword?: string) {
     let listed = false;
-    setManager({ stage: 'waiting', account });
+    setManager({ stage: 'waiting', manager: chosen, account });
     await perform<{ logins: PasswordManagerLogin[] }>(
       '/password-manager',
-      { account },
+      { manager: chosen.id, account, ...(masterPassword ? { masterPassword } : {}) },
       (result) => {
         listed = true;
-        setManager({ stage: 'list', account, logins: result.logins });
+        setManager({ stage: 'list', manager: chosen, account, logins: result.logins });
       },
-      `Nod couldn’t open ${managerName}. Try again.`,
+      `Nod couldn’t open ${chosen.name}. Try again.`,
       true,
     );
     if (!listed)
       setManager((current) =>
-        current?.stage === 'waiting' ? { stage: 'account', account } : current,
+        current?.stage === 'waiting' ? { stage: 'account', manager: chosen, account } : current,
       );
   }
-  function useManaged(account: string, id: string) {
-    return perform(
+  function useManaged(chosen: Manager, account: string, id: string) {
+    return perform<Parameters<typeof submitted>[0] & { authenticatorSkipped?: boolean }>(
       '/password-manager/use',
-      { account, id },
-      submitted,
+      { manager: chosen.id, account, id },
+      (result) => {
+        setKeySkipped(result.authenticatorSkipped === true);
+        submitted(result);
+      },
       'This login could not be used. Try again or choose another login.',
       true,
     );
@@ -524,8 +530,14 @@ function CredentialForm({ id, embedded, onClose, onRequestChange }: PrivateFormP
       >
         {saving && manager?.stage === 'waiting' ? (
           <div className="credential-complete" role="status" aria-live="polite">
-            <h1>Approve in {managerName}</h1>
-            <p>{managerName} asks before Nod can read your logins.</p>
+            <h1>
+              {manager.manager.masterPassword
+                ? `Opening ${managerName}…`
+                : `Approve in ${managerName}`}
+            </h1>
+            {!manager.manager.masterPassword && (
+              <p>{managerName} asks before Nod can read your logins.</p>
+            )}
             <Loading label={`Waiting for ${managerName}…`} />
           </div>
         ) : saving ? (
@@ -546,6 +558,12 @@ function CredentialForm({ id, embedded, onClose, onRequestChange }: PrivateFormP
             </div>
             <h1>{request?.kind === 'method' ? 'Continuing sign-in' : 'Details submitted'}</h1>
             <p>Your task will continue in chat.</p>
+            {keySkipped && (
+              <p>
+                Nod saved this login without its authenticator key because it couldn’t read the key,
+                so it will ask you for codes.
+              </p>
+            )}
             <BackToChat onClose={onClose} />
           </div>
         ) : request?.status === 'entering' ? (
@@ -657,23 +675,54 @@ function CredentialForm({ id, embedded, onClose, onRequestChange }: PrivateFormP
                 autoComplete="off"
                 onSubmit={(event) => {
                   event.preventDefault();
-                  const account = String(new FormData(event.currentTarget).get('account') ?? '');
-                  if (account.trim()) void listManaged(account.trim());
+                  const form = event.currentTarget;
+                  const data = new FormData(form);
+                  const account = String(data.get('account') ?? '');
+                  const masterPassword = String(data.get('masterPassword') ?? '');
+                  form.reset();
+                  if (account.trim())
+                    void listManaged(manager.manager, account.trim(), masterPassword || undefined);
                 }}
               >
                 <Field
-                  label={`${managerName} account`}
-                  hint={`The name at the top of the ${managerName} sidebar.`}
+                  label={
+                    manager.manager.masterPassword
+                      ? `${managerName} email`
+                      : `${managerName} account`
+                  }
+                  hint={
+                    manager.manager.masterPassword
+                      ? 'The account you signed in to with bw login.'
+                      : `The name at the top of the ${managerName} sidebar.`
+                  }
                 >
                   <Input
                     name="account"
-                    defaultValue={manager.account ?? request.passwordManager?.account}
+                    defaultValue={manager.account ?? manager.manager.account}
                     autoComplete="off"
-                    autoFocus
+                    autoFocus={
+                      !manager.manager.masterPassword ||
+                      !(manager.account ?? manager.manager.account)
+                    }
                     required
                     maxLength={200}
                   />
                 </Field>
+                {manager.manager.masterPassword && (
+                  <Field
+                    label="Master password"
+                    hint={`Unlocks ${managerName} for this choice. Nod doesn’t save it.`}
+                  >
+                    <Input
+                      name="masterPassword"
+                      type="password"
+                      autoComplete="off"
+                      autoFocus={Boolean(manager.account ?? manager.manager.account)}
+                      required
+                      maxLength={1024}
+                    />
+                  </Field>
+                )}
                 <Button className="credential-submit" type="submit" disabled={saving}>
                   Continue
                 </Button>
@@ -688,7 +737,7 @@ function CredentialForm({ id, embedded, onClose, onRequestChange }: PrivateFormP
                       key={login.id}
                       variant="outline"
                       disabled={saving}
-                      onClick={() => void useManaged(manager.account, login.id)}
+                      onClick={() => void useManaged(manager.manager, manager.account, login.id)}
                     >
                       <KeyRound size={16} />
                       <span>
@@ -706,7 +755,7 @@ function CredentialForm({ id, embedded, onClose, onRequestChange }: PrivateFormP
                 <Button
                   variant="ghost"
                   disabled={saving}
-                  onClick={() => setManager({ stage: 'account' })}
+                  onClick={() => setManager({ stage: 'account', manager: manager.manager })}
                 >
                   Use another account
                 </Button>
@@ -792,21 +841,24 @@ function CredentialForm({ id, embedded, onClose, onRequestChange }: PrivateFormP
                 </Button>
               </form>
             )}
-            {request?.passwordManager && !manager && (
-              <Button
-                variant="ghost"
-                disabled={saving}
-                onClick={() => {
-                  setError('');
-                  const account = request.passwordManager?.account;
-                  if (account) void listManaged(account);
-                  else setManager({ stage: 'account' });
-                }}
-              >
-                <KeyRound size={16} aria-hidden="true" />
-                Use {request.passwordManager.name}
-              </Button>
-            )}
+            {!manager &&
+              request?.passwordManagers?.map((offered) => (
+                <Button
+                  key={offered.id}
+                  variant="ghost"
+                  disabled={saving}
+                  onClick={() => {
+                    setError('');
+                    if (offered.account && !offered.masterPassword)
+                      void listManaged(offered, offered.account);
+                    else
+                      setManager({ stage: 'account', manager: offered, account: offered.account });
+                  }}
+                >
+                  <KeyRound size={16} aria-hidden="true" />
+                  Use {offered.name}
+                </Button>
+              ))}
           </>
         )}
         {error && <Notice>{error}</Notice>}

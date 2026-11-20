@@ -21,8 +21,16 @@ export class PasswordManagerError extends Error {
 }
 
 export interface PasswordManager {
+  readonly id: string;
   readonly name: string;
-  logins(account: string, origin: string, signal?: AbortSignal): Promise<PasswordManagerLogin[]>;
+  readonly setup: string;
+  readonly masterPassword?: boolean;
+  available?(): Promise<boolean>;
+  logins(
+    account: string,
+    origin: string,
+    options?: { masterPassword?: string; signal?: AbortSignal },
+  ): Promise<PasswordManagerLogin[]>;
   login(
     account: string,
     origin: string,

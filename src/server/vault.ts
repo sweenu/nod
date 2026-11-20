@@ -175,7 +175,7 @@ type VaultOptions = {
   ): Promise<void>;
   emailCode?(input: EmailCodeRequest, signal: AbortSignal): Promise<PrivateEmailCode | undefined>;
   icon?(origin: string): Promise<SiteIcon | null>;
-  passwordManager?: PasswordManager;
+  passwordManagers?: PasswordManager[];
 };
 type EntryRow = {
   id: string;
@@ -588,8 +588,13 @@ export async function createVault(pool: Pool, options: VaultOptions) {
     ALTER TABLE credential_account_selections ADD COLUMN IF NOT EXISTS kind text NOT NULL DEFAULT 'identifier';
     CREATE INDEX IF NOT EXISTS vault_entries_owner ON vault_entries(owner_id);
     CREATE TABLE IF NOT EXISTS password_manager_accounts (
-      owner_id text PRIMARY KEY, account text NOT NULL, updated_at timestamptz NOT NULL DEFAULT now()
+      owner_id text NOT NULL, manager text NOT NULL DEFAULT '1password', account text NOT NULL,
+      updated_at timestamptz NOT NULL DEFAULT now()
     );
+    ALTER TABLE password_manager_accounts ADD COLUMN IF NOT EXISTS manager text NOT NULL DEFAULT '1password';
+    ALTER TABLE password_manager_accounts DROP CONSTRAINT IF EXISTS password_manager_accounts_pkey;
+    CREATE UNIQUE INDEX IF NOT EXISTS password_manager_accounts_owner_manager
+      ON password_manager_accounts(owner_id, manager);
   `);
   const uses = await createVaultUses(pool, owner, options.analytics, options.signal);
   let keyPromise: Promise<Buffer> | undefined;
@@ -1433,15 +1438,10 @@ export async function createVault(pool: Pool, options: VaultOptions) {
         savedEntries.push({ ...metadata(entry), username: secret.username });
       }
     }
-    const manager =
-      options.passwordManager &&
-      status === 'pending' &&
-      (row.kind === 'identifier' || row.kind === 'password')
-        ? {
-            name: options.passwordManager.name,
-            ...(await managerAccount().then((account) => (account ? { account } : {}))),
-          }
-        : undefined;
+    const managers =
+      status === 'pending' && (row.kind === 'identifier' || row.kind === 'password')
+        ? await offeredManagers()
+        : [];
     return {
       id: token,
       turnId: row.turn_id,
@@ -1454,22 +1454,39 @@ export async function createVault(pool: Pool, options: VaultOptions) {
       ...(row.operation_status === 'not_entered' ? { notEntered: true } : {}),
       ...(savedEntries ? { savedEntries } : {}),
       ...(row.kind === 'password' && username ? { username } : {}),
-      ...(manager ? { passwordManager: manager } : {}),
+      ...(managers.length ? { passwordManagers: managers } : {}),
     };
   }
 
-  async function managerAccount() {
-    return (
-      await pool.query<{ account: string }>(
-        'SELECT account FROM password_manager_accounts WHERE owner_id=$1',
-        [owner],
-      )
-    ).rows[0]?.account;
+  async function usable(manager: PasswordManager) {
+    return !manager.available || (await manager.available().catch(() => false));
   }
 
-  async function managedRequest(token: string) {
-    const manager = options.passwordManager;
-    if (!manager) throw new VaultError('No password manager is available here.', 404);
+  async function offeredManagers() {
+    const managers = [];
+    for (const manager of options.passwordManagers ?? [])
+      if (await usable(manager)) managers.push(manager);
+    if (!managers.length) return [];
+    const accounts = new Map(
+      (
+        await pool.query<{ manager: string; account: string }>(
+          'SELECT manager, account FROM password_manager_accounts WHERE owner_id=$1',
+          [owner],
+        )
+      ).rows.map((row) => [row.manager, row.account]),
+    );
+    return managers.map((manager) => ({
+      id: manager.id,
+      name: manager.name,
+      ...(accounts.has(manager.id) ? { account: accounts.get(manager.id)! } : {}),
+      ...(manager.masterPassword ? { masterPassword: true } : {}),
+    }));
+  }
+
+  async function managedRequest(token: string, id: string) {
+    const manager = options.passwordManagers?.find((candidate) => candidate.id === id);
+    if (!manager || !(await usable(manager)))
+      throw new VaultError('This password manager isn’t available here.', 404);
     const row = (
       await pool.query<RequestRow>(
         `SELECT r.* FROM credential_requests r JOIN turns u ON u.id=r.turn_id AND u.owner_id=r.owner_id
@@ -1486,42 +1503,54 @@ export async function createVault(pool: Pool, options: VaultOptions) {
     return { manager, row };
   }
 
-  function managerFailure(name: string, error: unknown): never {
+  function managerFailure(manager: PasswordManager, error: unknown): never {
     if (!(error instanceof PasswordManagerError)) throw error;
     throw new VaultError(
       error.reason === 'unavailable'
-        ? `Nod can’t reach ${name} on this computer. Open ${name}, sign in, and turn on Settings → Developer → Integrate with other apps. (${error.message})`
+        ? `Nod can’t reach ${manager.name} on this computer. ${manager.setup} (${error.message})`
         : error.message,
       error.reason === 'missing' ? 409 : 502,
     );
   }
 
   async function managedLogins(token: string, raw: unknown) {
-    const { account } = z
-      .object({ account: z.string().trim().min(1).max(200) })
+    const input = z
+      .object({
+        manager: z.string().min(1).max(50),
+        account: z.string().trim().min(1).max(200),
+        masterPassword: z.string().min(1).max(1024).optional(),
+      })
       .strict()
       .parse(raw);
-    const { manager, row } = await managedRequest(token);
+    const { manager, row } = await managedRequest(token, input.manager);
     const logins = await manager
-      .logins(account, row.origin)
-      .catch((error: unknown) => managerFailure(manager.name, error));
+      .logins(input.account, row.origin, { masterPassword: input.masterPassword })
+      .catch((error: unknown) => managerFailure(manager, error));
     await pool.query(
-      `INSERT INTO password_manager_accounts(owner_id,account) VALUES($1,$2)
-       ON CONFLICT(owner_id) DO UPDATE SET account=excluded.account,updated_at=now()`,
-      [owner, account],
+      `INSERT INTO password_manager_accounts(owner_id,manager,account) VALUES($1,$2,$3)
+       ON CONFLICT(owner_id,manager) DO UPDATE SET account=excluded.account,updated_at=now()`,
+      [owner, manager.id, input.account],
     );
     return { logins };
   }
 
   async function useManaged(token: string, raw: unknown) {
-    const { account, id } = z
-      .object({ account: z.string().trim().min(1).max(200), id: z.string().min(1).max(300) })
+    const input = z
+      .object({
+        manager: z.string().min(1).max(50),
+        account: z.string().trim().min(1).max(200),
+        id: z.string().min(1).max(300),
+      })
       .strict()
       .parse(raw);
-    const { manager, row } = await managedRequest(token);
+    const { manager, row } = await managedRequest(token, input.manager);
     const secret = await manager
-      .login(account, row.origin, id)
-      .catch((error: unknown) => managerFailure(manager.name, error));
+      .login(input.account, row.origin, input.id)
+      .catch((error: unknown) => managerFailure(manager, error));
+    const key =
+      secret.authenticatorKey && authenticatorKey(secret.authenticatorKey)
+        ? secret.authenticatorKey
+        : undefined;
     const saved = await transaction(
       (client) =>
         saveEntry(
@@ -1531,16 +1560,15 @@ export async function createVault(pool: Pool, options: VaultOptions) {
             origin: row.origin,
             username: secret.username,
             password: secret.password,
-            ...(secret.authenticatorKey && authenticatorKey(secret.authenticatorKey)
-              ? { authenticatorKey: secret.authenticatorKey }
-              : {}),
+            ...(key ? { authenticatorKey: key } : {}),
           },
           client,
         ),
       pool,
     );
     if (saved.operation) track('login', saved.operation, 'user');
-    return consume(token, { kind: 'saved', entryId: saved.entry.id });
+    const result = await consume(token, { kind: 'saved', entryId: saved.entry.id });
+    return secret.authenticatorKey && !key ? { ...result, authenticatorSkipped: true } : result;
   }
 
   type LoginSource =

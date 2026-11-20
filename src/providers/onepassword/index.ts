@@ -226,9 +226,11 @@ export function createOnePassword(options: {
   }
 
   return {
+    id: '1password',
     name: '1Password',
-    logins: async (account, origin, signal) =>
-      answer(loginsValue, await call({ method: 'logins', account, origin }, signal)),
+    setup: 'Open 1Password, sign in, and turn on Settings → Developer → Integrate with other apps.',
+    logins: async (account, origin, options) =>
+      answer(loginsValue, await call({ method: 'logins', account, origin }, options?.signal)),
     login: async (account, origin, item, signal) =>
       answer(loginValue, await call({ method: 'login', account, origin, item }, signal)),
     close,
